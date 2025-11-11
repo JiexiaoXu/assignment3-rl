@@ -1,30 +1,47 @@
 """
-GRPO Skeleton: Colocated Synchronous Training Loop
--------------------------------------------------
+GRPO Skeleton: Colocated Synchronous Training Loop (Simplified)
+--------------------------------------------------------------
 Students should complete the TODO parts to:
- - implement rollout generation with reward computation
- - perform policy updates using GRPO/PPO
- - manage replay buffer for training samples
+ - implement rollout generation with reward computation using TransformerLM
+ - perform policy updates using GRPO algorithm
+ - implement keyword inclusion reward function
 
 This version combines Generator and Learner into a single actor for simplified
-synchronous training, with reward computation happening directly in the generator.
+synchronous training without replay buffer, training directly on each trajectory.
 """
 
 import argparse
+import asyncio
 import ray
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
+import tiktoken
+import time
 from typing import List, Dict, Any
 import numpy as np
+
+from cse599o_basics.model import TransformerLM
+from cse599o_basics.optimizer import AdamW
+from cse599o_alignment.grpo import (
+    compute_group_normalized_reward,
+    grpo_microbatch_train_step,
+    gradient_clipping
+)
 
 
 # ===================== Basic setup =====================
 
-G = 4  # group size (number of actions per prompt)
-STATE_DIM = 4
-ACTION_DIM = 4
+G = 4  # group size (number of responses per prompt)
+VOCAB_SIZE = tiktoken.get_encoding("gpt2").n_vocab
+CONTEXT_LENGTH = 256
+NUM_LAYERS = 4
+D_MODEL = 512
+NUM_HEADS = 16
+D_FF = 1344
+THETA = 10000
+CHECKPOINT_PATH = "/homes/iws/cxyzhao/student-version/assignment5-alignment/checkpoint/999"
 
 
 def get_device():
@@ -34,66 +51,57 @@ def get_device():
 # ===================== Data container =====================
 
 class Trajectory:
-    """A single rollout sample with rewards."""
-    def __init__(self, state, actions, logps, rewards):
-        self.state = state
-        self.actions = actions
-        self.logps = logps
+    """Stores a single rollout trajectory for text generation"""
+
+    def __init__(
+        self,
+        prompts: List[str],  # shape: [G]
+        responses: List[str],  # shape: [G]
+        rewards: torch.Tensor,  # shape: [G]
+        log_probs: torch.Tensor,  # shape: [G]
+        values: Optional[torch.Tensor] = None,  # shape: [G]
+    ):
+        self.prompts = prompts
+        self.responses = responses
         self.rewards = rewards
+        self.log_probs = log_probs
+        self.values = values
 
 
 # ===================== Base classes (no @ray.remote) =====================
 
 class Generator:
-    """Base generator class for rollout generation and reward computation."""
+    """Base class for text generation using TransformerLM"""
+
     def __init__(self):
         self.device = get_device()
-        self.model = nn.Sequential(
-            nn.Linear(STATE_DIM, 16),
-            nn.Tanh(),
-            nn.Linear(16, ACTION_DIM),
-        ).to(self.device)
-    
-    def generate_rollout(self, state: torch.Tensor, num_actions: int = G) -> Trajectory:
-        """Generate a rollout with actions, log-probs, and rewards."""
-        # TODO: Implement rollout generation
-        # 1. Sample actions from the current policy
-        # 2. Compute log probabilities
-        # 3. Compute rewards for the actions
-        # 4. Return Trajectory object
-        
-        # Placeholder implementation
-        actions = torch.randint(0, ACTION_DIM, (num_actions,), device=self.device)
-        logps = torch.zeros(num_actions, device=self.device)
-        rewards = torch.zeros(num_actions, device=self.device)
-        
-        return Trajectory(state, actions, logps, rewards)
-    
-    def compute_rewards(self, state: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """Compute rewards for generated actions."""
-        # TODO: Implement reward model
-        # This is where you would implement your reward function
-        # For now, return dummy rewards
-        return torch.randn(actions.shape[0], device=self.device)
+        # TODO: Initialize the TransformerLM model
+        # self.model = TransformerLM(...)
+        # self.model.load_checkpoint(CHECKPOINT_PATH)
+        # self.tokenizer = tiktoken.get_encoding("gpt2")
+
+    def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
+        """
+        Generate G responses for each prompt using TransformerLM.
+
+        TODO: Implement this method
+        - For each prompt, generate G responses using self.model
+        - Calculate log probabilities for generated tokens
+        - Return list of Trajectory objects with prompts, responses, log_probs
+        """
+        raise NotImplementedError("Students should implement this method")
 
 
 class Learner:
-    """Base learner class for policy updates."""
+    """Base learner class for policy gradient updates using TransformerLM."""
     def __init__(self):
         self.device = get_device()
-        self.model = nn.Sequential(
-            nn.Linear(STATE_DIM, 16),
-            nn.Tanh(),
-            nn.Linear(16, ACTION_DIM),
-        ).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        self.replay_buffer = []
+        # TODO: Initialize the same TransformerLM model as Generator
+        # self.model = TransformerLM(...)
+        # self.model.load_checkpoint(CHECKPOINT_PATH)
+        # self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
     
-    def add_trajectory(self, trajectory: Trajectory):
-        """Add trajectory to replay buffer."""
-        # TODO: Implement replay buffer management
-        # Consider buffer size limits, oldest sample removal, etc.
-        pass
+
     
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
@@ -124,57 +132,53 @@ class ColocatedWorker(Generator, Learner):
         Learner.__init__(self)
         self.step_count = 0
     
-    async def training_step(self, state: torch.Tensor) -> Dict[str, Any]:
+    async def training_step(self, prompts: List[str]) -> Dict[str, Any]:
         """Perform one complete training step: generate rollout + update policy."""
-        # Generate rollout with rewards
-        trajectory = self.generate_rollout(state)
+        # Generate trajectories for the batch of prompts
+        trajectories = self.generate_trajectories(prompts)
         
-        # Add to replay buffer
-        self.add_trajectory(trajectory)
-        
-        # Update policy if we have enough samples
-        loss = 0.0
-        if len(self.replay_buffer) >= G:  # Wait for at least one group
-            # TODO: Sample trajectories for training
-            sampled_trajectories = []  # Implement sampling logic
-            loss = self.update_policy(sampled_trajectories)
+        # Update policy using GRPO
+        loss = self.update_policy(trajectories)
         
         self.step_count += 1
         
         return {
             'step': self.step_count,
             'loss': loss,
-            'trajectory_length': len(trajectory.actions),
-            'avg_reward': float(trajectory.rewards.mean()) if len(trajectory.rewards) > 0 else 0.0
+            'num_trajectories': len(trajectories),
+            'avg_reward': float(torch.cat([traj.rewards for traj in trajectories]).mean()) if trajectories else 0.0
         }
     
     async def get_statistics(self) -> Dict[str, Any]:
         """Get current training statistics."""
         return {
             'step_count': self.step_count,
-            'buffer_size': len(self.replay_buffer),
-            'model_parameters': sum(p.numel() for p in self.model.parameters())
+            'model_parameters': sum(p.numel() for p in self.model.parameters()) if hasattr(self, 'model') else 0
         }
 
 
 # ===================== Training loop =====================
 
 async def run_training(num_steps: int = 10, num_workers: int = 1):
-    """Run colocated training with specified number of workers."""
+    """Run colocated GRPO training with text generation."""
     
-    # Create workers
+    # Create workers  
     workers = [ColocatedWorker.remote() for _ in range(num_workers)]
     
-    print(f"Starting training with {num_workers} colocated workers for {num_steps} steps...")
+    # TODO: Define training prompts
+    # training_prompts = ["Write a story about", "Explain the concept of", "Describe how to"]
+    
+    print(f"Starting GRPO training with {num_workers} colocated workers for {num_steps} steps...")
     
     for step in range(num_steps):
-        # Generate random states for each worker
-        states = [torch.randn(STATE_DIM) for _ in range(num_workers)]
+        # TODO: Sample prompts for each worker
+        # For now, using placeholder prompts
+        prompt_batches = [["Sample prompt"] * G for _ in range(num_workers)]
         
         # Run training step on all workers in parallel
         futures = [
-            worker.training_step.remote(state) 
-            for worker, state in zip(workers, states)
+            worker.training_step.remote(prompts) 
+            for worker, prompts in zip(workers, prompt_batches)
         ]
         
         # Wait for all workers to complete
