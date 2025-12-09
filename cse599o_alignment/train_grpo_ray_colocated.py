@@ -16,11 +16,13 @@ import ray
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
 import tiktoken
 import time
 from typing import List, Dict, Any, Optional
 import numpy as np
+from pathlib import Path
 
 from cse599o_basics.tokenizer import BPETokenizer
 from cse599o_basics.transformer_lm import TransformerLM
@@ -57,22 +59,18 @@ USE_STD_NORMALIZATION: bool = True
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def keyword_inclusion_reward_fn(response: str, keywords: List[str]) -> float:
+def keyword_inclusion_reward_fn(response: str, keywords: List[str]) -> Dict[str, float]:
+    """
+    Simple deterministic reward: 1.0 only if all keywords are present in the response.
+    Matches the reward_fn signature used by compute_group_normalized_reward.
+    """
     if not keywords:
-        return 0.0
-    
+        return {"reward": 0.0}
+
     response_lower = response.lower()
     keywords_lower = [kw.lower() for kw in keywords]
-
-    # reward only if all keywords are included
-    if all(kw in response_lower for kw in keywords_lower):
-        return {
-            "reward": 1.0,
-        }
-    else:
-        return {
-            "reward": 0.0,
-        }
+    reward = 1.0 if all(kw in response_lower for kw in keywords_lower) else 0.0
+    return {"reward": reward}
 
 def generate_text(
     prompt: str,
@@ -82,7 +80,7 @@ def generate_text(
     max_gen_length: int,
     temperature: float,
     top_p_threshold: float,
-) -> tuple[str, torch.Tensor]:
+) -> tuple[str, torch.Tensor, torch.Tensor]:
     def temperature_softmax(logits, temperature):
         logits = logits / max(temperature, 1e-8)
         return torch.softmax(logits, dim=-1)
@@ -106,7 +104,7 @@ def generate_text(
     with torch.no_grad():
         # Tokenize the prompt
         accum_output = tokenizer.encode(prompt)
-        accum_output = torch.tensor(accum_output, dtype=torch.long, device="cuda")
+        accum_output = torch.tensor(accum_output, dtype=torch.long, device=get_device())
         eos_token_id = tokenizer.encode("<|endoftext|>")[0]
 
         log_probs = []
@@ -129,7 +127,7 @@ def generate_text(
 
             # Get log probabilities
             token_log_prob = torch.log(softmax_logits[sampled_token])
-            log_probs.append(token_log_prob)
+            log_probs.append(token_log_prob.squeeze())
 
             if sampled_token.item() == eos_token_id:
                 break
@@ -138,8 +136,9 @@ def generate_text(
 
         # Decode the generated text
         generated_text = tokenizer.decode(accum_output.tolist())
-        total_log_prob = torch.sum(torch.stack(log_probs)) if log_probs else torch.tensor(0.0, device=accum_output.device)
-    return generated_text, total_log_prob
+        response_len = len(accum_output) - len(tokenizer.encode(prompt))
+        response_log_probs = torch.stack(log_probs) if log_probs else torch.tensor([], device=accum_output.device)
+    return generated_text, accum_output, response_log_probs
 
 # ===================== Data container =====================
 
@@ -151,7 +150,7 @@ class Trajectory:
         prompts: List[str],  # shape: [G]
         responses: List[str],  # shape: [G]
         rewards: torch.Tensor,  # shape: [G]
-        log_probs: torch.Tensor,  # shape: [G]
+        log_probs: List[torch.Tensor],  # per-response token log-probs
         values: Optional[torch.Tensor] = None,  # shape: [G]
     ):
         self.prompts = prompts
@@ -196,14 +195,13 @@ class Generator:
         trajectories: List[Trajectory] = []
 
         for prompt in prompts:
-            # use the last work of prompt as keywords
             keyword = prompt.strip().split()[-1]
-            prompts = [keyword] * G
-
+            prompt_group = [prompt] * G
             responses = []
             log_probs = []
+            rewards = []
             for _ in range(G):
-                response, log_prob = generate_text(
+                response, token_ids, resp_log_probs = generate_text(
                     prompt=prompt,
                     model=self.model,
                     tokenizer=self.tokenizer,
@@ -213,13 +211,16 @@ class Generator:
                     top_p_threshold=0.9,
                 )
                 responses.append(response)
-                log_probs.append(log_prob)
+                # Store per-token log probs (old policy) for the generated response
+                log_probs.append(resp_log_probs)
+                reward_dict = keyword_inclusion_reward_fn(response, [keyword])
+                rewards.append(reward_dict["reward"])
 
             trajectory = Trajectory(
-                prompts=prompts,
+                prompts=prompt_group,
                 responses=responses,
-                rewards=torch.zeros(G, device=self.device),  # Placeholder
-                log_probs=log_probs,
+                rewards=torch.tensor(rewards, device=self.device),
+                log_probs=[lp.detach() for lp in log_probs],
             )
             trajectories.append(trajectory)
 
@@ -244,26 +245,53 @@ class Learner:
         load_checkpoint(CHECKPOINT_PATH, self.model, None)
         self.optimizer = AdamW(
             self.model.parameters(),
-            lr=1e-5,
+            lr=LEARNING_RATE,
             weight_decay=0.01,
         )
-    
 
-    
+    def _compute_response_log_probs(
+        self, prompt: str, response: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-token log-probabilities for the response portion."""
+        prompt_ids = self.tokenizer.encode(prompt)
+        response_ids = self.tokenizer.encode(response)
+        all_ids = prompt_ids + response_ids
+
+        if len(all_ids) < 2:
+            empty = torch.zeros(1, device=self.device)
+            return empty, empty
+
+        input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
+        target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
+
+        logits = self.model(input_ids)
+        log_probs_all = torch.log_softmax(logits, dim=-1)
+        token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
+
+        response_start = max(len(prompt_ids) - 1, 0)
+        response_log_probs = token_log_probs[:, response_start:]
+        response_mask = torch.ones_like(response_log_probs, dtype=torch.float32)
+        return response_log_probs.squeeze(0), response_mask.squeeze(0)
+
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
         # TODO: Implement GRPO advantage computation
         # This should implement the group-relative advantage computation
         # that's central to GRPO algorithm
-        rollout_responses = torch.cat([traj.responses for traj in trajectories])
-        repeated_ground_truths = torch.cat([traj.prompts for traj in trajectories])
-        group_size = G
+        rollout_responses: List[str] = []
+        repeated_ground_truths: List[List[str]] = []
+
+        for traj in trajectories:
+            for prompt, response in zip(traj.prompts, traj.responses):
+                rollout_responses.append(response)
+                keyword = prompt.strip().split()[-1]
+                repeated_ground_truths.append([keyword])
 
         advantages, _, _ = compute_group_normalized_reward(
             rollout_responses=rollout_responses,
             repeated_ground_truths=repeated_ground_truths,
             reward_fn=keyword_inclusion_reward_fn,
-            group_size=group_size,
+            group_size=G,
             normalized_by_std=USE_STD_NORMALIZATION,
             advantage_eps=ADVANTAGE_EPS,
         )
@@ -278,18 +306,48 @@ class Learner:
         # 3. Perform optimizer step
         # 4. Return loss value
 
+        if not trajectories:
+            return 0.0
+
         advantages = self.compute_advantages(trajectories)
-        loss = grpo_microbatch_train_step(
-            model=self.model,
-            optimizer=self.optimizer,
-            trajectories=trajectories,
-            advantages=advantages,
+
+        policy_log_probs_list = []
+        old_log_probs_list = []
+        response_masks = []
+
+        for traj in trajectories:
+            for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
+                policy_lp, mask = self._compute_response_log_probs(prompt, response)
+                policy_log_probs_list.append(policy_lp)
+                response_masks.append(mask)
+                old_log_probs_list.append(old_lp.to(self.device))
+
+        max_len = max(lp.shape[0] for lp in policy_log_probs_list)
+
+        def pad_to_len(t: torch.Tensor, length: int) -> torch.Tensor:
+            if t.numel() == length:
+                return t
+            return F.pad(t, (0, length - t.numel()))
+
+        policy_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in policy_log_probs_list])
+        old_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in old_log_probs_list])
+        response_mask = torch.stack([pad_to_len(mask, max_len) for mask in response_masks])
+
+        self.optimizer.zero_grad()
+        loss, _ = grpo_microbatch_train_step(
+            policy_log_probs=policy_log_probs,
+            response_mask=response_mask,
+            gradient_accumulation_steps=1,
             loss_type=LOSS_TYPE,
+            advantages=advantages.unsqueeze(-1).to(self.device),
+            old_log_probs=old_log_probs,
             cliprange=0.2,
-            max_grad_norm=1.0,
         )
-        
-        return loss
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+
+        return float(loss.item())
 
 
 # ===================== Combined Actor =====================
@@ -337,7 +395,8 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
 
     # TODO: Define training prompts
     base_prompt = "Generate a story that includes "
-    with open("/homes/iws/jiexiao/cse599o/hw3/assignment3-rl/cse599o_alignment/prompts/keywords.txt", "r") as f:
+    keywords_path = Path(__file__).resolve().parent / "prompts" / "keywords.txt"
+    with open(keywords_path, "r") as f:
         keywords = [line.strip() for line in f.readlines()]
     prompts = [base_prompt + kw for kw in keywords]
 
