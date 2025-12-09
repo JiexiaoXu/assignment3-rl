@@ -23,6 +23,7 @@ dependencies = [
     "ray>=2.51.1",
     "cupy-cuda13x",
     "nixl",
+    "matplotlib",
 ]
 
 [tool.setuptools.packages.find]

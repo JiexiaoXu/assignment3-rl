@@ -258,11 +258,12 @@ class Learner:
         )
 
     def compute_response_log_probs(
-        self, prompt: str, response: str
+        self, prompt: str, response: str, model: Optional[TransformerLM] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prompt_ids = self.tokenizer.encode(prompt)
         response_ids = self.tokenizer.encode(response)
         all_ids = prompt_ids + response_ids
+        model = model if model is not None else self.learner_model
 
         if len(all_ids) < 2:
             empty = torch.zeros(1, device=self.device)
@@ -271,7 +272,7 @@ class Learner:
         input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
         target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
 
-        logits = self.learner_model(input_ids)
+        logits = model(input_ids)
         log_probs_all = torch.log_softmax(logits, dim=-1)
         token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
 
@@ -326,6 +327,7 @@ class Learner:
 
         policy_log_probs_list = []
         old_log_probs_list = []
+        ref_log_probs_list = []
         response_masks = []
 
         # Compute new log probs
@@ -333,6 +335,9 @@ class Learner:
             for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
                 policy_lp, mask = self.compute_response_log_probs(prompt, response)
                 policy_log_probs_list.append(policy_lp)
+                with torch.no_grad():
+                    ref_lp, _ = self.compute_response_log_probs(prompt, response, model=self.fronzen_model)
+                    ref_log_probs_list.append(ref_lp.to(self.device))
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
 
@@ -340,6 +345,7 @@ class Learner:
 
         policy_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in policy_log_probs_list])
         old_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in old_log_probs_list])
+        ref_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in ref_log_probs_list])
         response_mask = torch.stack([pad_to_len(mask, max_len) for mask in response_masks])
 
         self.optimizer.zero_grad()
@@ -355,7 +361,12 @@ class Learner:
 
         self.optimizer.step()
 
-        return float(loss.item())
+        with torch.no_grad():
+            kl_per_token = (policy_log_probs - ref_log_probs) * torch.exp(policy_log_probs)
+            kl_batch = (kl_per_token * response_mask).sum(dim=1)  # sum over tokens per rollout
+            kl_value = kl_batch.mean()
+
+        return float(loss.item()), float(kl_value.item())
 
 
 # ===================== Combined Actor =====================
@@ -385,6 +396,7 @@ class ColocatedWorker(Generator, Learner):
         self.gen_times = []
         self.learn_times = []
         self.sync_times = []
+        self.kl_values = []
 
     
     def training_step(self, prompts: List[str]) -> Dict[str, Any]:
@@ -406,7 +418,7 @@ class ColocatedWorker(Generator, Learner):
         
         # Update policy using GRPO
         learn_start.record()
-        loss = self.update_policy(trajectories)
+        loss, kl_value = self.update_policy(trajectories)
         learn_end.record()
         torch.cuda.synchronize()
         self.learn_times.append(learn_start.elapsed_time(learn_end))
@@ -419,6 +431,8 @@ class ColocatedWorker(Generator, Learner):
         sync_end.record()
         torch.cuda.synchronize()
         self.sync_times.append(sync_start.elapsed_time(sync_end))
+
+        self.kl_values.append(kl_value)
         
         return {
             'step': self.step_count,
@@ -435,6 +449,7 @@ class ColocatedWorker(Generator, Learner):
             'avg_gen_time_ms': np.mean(self.gen_times) if self.gen_times else 0.0,
             'avg_learn_time_ms': np.mean(self.learn_times) if self.learn_times else 0.0,
             'avg_sync_time_ms': np.mean(self.sync_times) if self.sync_times else 0.0,
+            'kl_values': self.kl_values,
         }
 
 
@@ -468,6 +483,15 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
                   f"Avg Gen Time={stats['avg_gen_time_ms']:.2f}ms, "
                   f"Avg Learn Time={stats['avg_learn_time_ms']:.2f}ms, "
                   f"Avg Sync Time={stats['avg_sync_time_ms']:.2f}ms")
+            
+            # plot KL values if needed
+            import matplotlib.pyplot as plt
+            if stats['kl_values']:
+                plt.plot(stats['kl_values'])
+                plt.title(f"Worker {i} KL Divergence over Steps")
+                plt.xlabel("Step")
+                plt.ylabel("KL Divergence")
+                plt.savefig(f"kl_divergence.png")
 
 
 def run_once(num_steps: int = 10, num_workers: int = 1):

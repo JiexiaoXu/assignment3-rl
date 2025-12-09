@@ -20,26 +20,38 @@ import time
 from typing import List, Dict, Any, Optional
 import numpy as np
 
-from cse599o_basics.model import TransformerLM
+from cse599o_basics.tokenizer import BPETokenizer
+from cse599o_basics.transformer_lm import TransformerLM
 from cse599o_basics.optimizer import AdamW
+from cse599o_basics.training_util import load_checkpoint
 from cse599o_alignment.grpo import (
     compute_group_normalized_reward,
     grpo_microbatch_train_step,
-    gradient_clipping
+    compute_grpo_clip_loss
 )
+from cse599o_alignment.grpo import keyword_inclusion_reward_fn
+
 
 
 # ===================== Basic setup =====================
 
 G = 4  # group size (number of responses per prompt)
 VOCAB_SIZE = tiktoken.get_encoding("gpt2").n_vocab
-CONTEXT_LENGTH = 256
-NUM_LAYERS = 4
+CONTEXT_LENGTH = 512
+NUM_LAYERS = 10
 D_MODEL = 512
 NUM_HEADS = 16
 D_FF = 1344
 THETA = 10000
-CHECKPOINT_PATH = ""
+CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint01_step8000.pth"
+
+N_GRPO_STEPS: int = 100
+LEARNING_RATE: float = 5e-4
+SAMPLING_TEMPERATURE: float = 0.8
+SAMPLING_MAX_TOKENS: int = 60
+ADVANTAGE_EPS: float = 1e-8
+LOSS_TYPE: str = "grpo_clip"
+USE_STD_NORMALIZATION: bool = True
 
 
 def get_device():
@@ -56,7 +68,7 @@ class Trajectory:
         prompts: List[str],  # shape: [G]
         responses: List[str],  # shape: [G]
         rewards: torch.Tensor,  # shape: [G]
-        log_probs: torch.Tensor,  # shape: [G]
+        log_probs: List[torch.Tensor],  # per-response token log-probs shape: [G][seq_len]
         values: Optional[torch.Tensor] = None,  # shape: [G]
     ):
         self.version = version
@@ -77,11 +89,15 @@ class TrajectoryQueue:
 
     def put(self, traj: Trajectory):
         # TODO: implement trajectory queuing
-        pass
+        self.q.put_nowait(traj)
 
     def get(self):
         # TODO: implement trajectory retrieval with timeout
-        return None
+        timeout = 5.0  # seconds
+        try:
+            return asyncio.wait_for(self.q.get(), timeout)
+        except asyncio.TimeoutError:
+            return None
 
 
 @ray.remote
@@ -92,11 +108,13 @@ class ReplayBuffer:
 
     def put(self, traj: Trajectory):
         # TODO: store completed trajectories here
-        pass
+        self.data.append(traj)
 
     def sample(self, k: int):
         # TODO: sample k trajectories for training
-        return []
+        indices = np.random.choice(len(self.data), size=k, replace=False)
+        sampled = [self.data[i] for i in indices]
+        return sampled
 
 
 @ray.remote
@@ -114,7 +132,13 @@ class Scorer:
             # TODO: Get trajectories from queue, compute rewards, store in replay buffer
             # This should implement a reward function that evaluates text quality
             # e.g., keyword inclusion, safety, helpfulness, etc.
-            pass
+            traj = ray.get(self.traj_q.get())
+            for prompt, response in zip(traj.prompts, traj.responses):
+                keyword = prompt.strip().split()[-1]
+                reward = keyword_inclusion_reward_fn(response, keyword)
+                traj.rewards.append(reward)
+            self.replay_buf.put(traj)
+            
 
     def stop(self):
         self.running = False
@@ -125,18 +149,23 @@ class Learner:
     """Learns policy updates from the replay buffer using TransformerLM."""
     def __init__(self, replay_buf):
         self.device = get_device()
-        # TODO: Initialize the TransformerLM model
-        # self.model = TransformerLM(
-        #     vocab_size=VOCAB_SIZE,
-        #     context_length=CONTEXT_LENGTH,
-        #     num_layers=NUM_LAYERS,
-        #     d_model=D_MODEL,
-        #     num_heads=NUM_HEADS,
-        #     d_ff=D_FF,
-        #     theta=THETA
-        # ).to(self.device)
-        # self.model.load_checkpoint(CHECKPOINT_PATH)
-        # self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        self.learner_model = TransformerLM(
+            vocab_size=VOCAB_SIZE,
+            context_length=CONTEXT_LENGTH,
+            num_layers=NUM_LAYERS,
+            d_model=D_MODEL,
+            num_heads=NUM_HEADS,
+            d_ff=D_FF,
+            theta=THETA,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        load_checkpoint(CHECKPOINT_PATH, self.learner_model, None)
+        self.optimizer = AdamW(
+            self.learner_model.parameters(),
+            lr=LEARNING_RATE,
+            weight_decay=0.01,
+        )
         self.version = 0
         self.replay_buf = replay_buf
 
@@ -144,13 +173,34 @@ class Learner:
         """One GRPO/PPO-style update step."""
         # TODO: sample from replay buffer, compute advantages, update model
         # This should implement GRPO policy gradient updates for text generation
+        sampled_trajectories = ray.get(self.replay_buf.sample.remote(k=8))
+        rollout_responses: List[str] = []
+        repeated_ground_truths: List[List[str]] = []
+
+        for traj in sampled_trajectories:
+            for prompt, response in zip(traj.prompts, traj.responses):
+                rollout_responses.append(response)
+                keyword = prompt.strip().split()[-1]
+                repeated_ground_truths.append([keyword])
+
+        advantages, _, _ = compute_group_normalized_reward(
+            rollout_responses=rollout_responses,
+            repeated_ground_truths=repeated_ground_truths,
+            reward_fn=keyword_inclusion_reward_fn,
+            group_size=G,
+            normalized_by_std=USE_STD_NORMALIZATION,
+            advantage_eps=ADVANTAGE_EPS,
+        )
+
+
+
         loss = torch.tensor(0.0, device=self.device)
         self.version += 1
         return float(loss.item())
 
     def get_weights(self):
         # TODO: Return model weights for synchronization with Generator
-        return {}  # {k: v.cpu() for k, v in self.model.state_dict().items()}
+        return {k: v.cpu() for k, v in self.learner_model.state_dict().items()}
 
     def get_version(self):
         return self.version
@@ -162,36 +212,63 @@ class Generator:
     def __init__(self, traj_q):
         self.device = get_device()
         # TODO: Initialize the TransformerLM model
-        # self.model = TransformerLM(
-        #     vocab_size=VOCAB_SIZE,
-        #     context_length=CONTEXT_LENGTH,
-        #     num_layers=NUM_LAYERS,
-        #     d_model=D_MODEL,
-        #     num_heads=NUM_HEADS,
-        #     d_ff=D_FF,
-        #     theta=THETA
-        # ).to(self.device)
-        # self.model.load_checkpoint(CHECKPOINT_PATH)
-        # self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.actor_model = TransformerLM(
+            vocab_size=VOCAB_SIZE,
+            context_length=CONTEXT_LENGTH,
+            num_layers=NUM_LAYERS,
+            d_model=D_MODEL,
+            num_heads=NUM_HEADS,
+            dff=D_FF,
+            theta=THETA,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        load_checkpoint(CHECKPOINT_PATH, self.actor_model, None)
+        self.tokenizer = tiktoken.get_encoding("gpt2")
         self.traj_q = traj_q
         self.version = 0
 
     def generate(self, prompts: List[str]):
         """Generate text responses and send to Scorer."""
-        # TODO: Generate G responses for each prompt using TransformerLM
-        # - Tokenize prompts
-        # - Generate text responses using self.model
-        # - Calculate log probabilities for generated tokens
-        # - Create Trajectory objects and send to trajectory queue
-        pass
+        from cse599o_alignment.train_grpo_ray_colocated import generate_text
+
+        for prompt in prompts:
+            keyword = prompt.strip().split()[-1]
+            prompt_group = [prompt] * G
+            responses = []
+            log_probs = []
+            rewards = []
+            for _ in range(G):
+                response, resp_log_probs = generate_text(
+                    prompt=prompt,
+                    model=self.actor_model,
+                    tokenizer=self.tokenizer,
+                    context_length=CONTEXT_LENGTH,
+                    max_gen_length=SAMPLING_MAX_TOKENS,
+                    temperature=SAMPLING_TEMPERATURE,
+                    top_p_threshold=0.9,
+                )
+                responses.append(response)
+                # Store per-token log probs (old policy) for the generated response
+                log_probs.append(resp_log_probs)
+
+            trajectory = Trajectory(
+                prompts=prompt_group,
+                responses=responses,
+                rewards=[],
+                log_probs=[lp.detach() for lp in log_probs],
+            )
+            self.traj_q.put(trajectory)
+
+        
 
     def update(self, weights: Dict, version: int):
         """Load updated learner weights."""
         # TODO: Update model weights from learner
-        # sd = self.model.state_dict()
-        # for n, w in weights.items():
-        #     sd[n] = w.to(self.device)
-        # self.model.load_state_dict(sd)
+        sd = self.actor_model.state_dict()
+        for n, w in weights.items():
+            sd[n] = w.to(self.device)
+        self.actor_model.load_state_dict(sd)
         self.version = version
 
 
