@@ -29,7 +29,7 @@ from cse599o_basics.training_util import load_checkpoint
 from cse599o_alignment.grpo import (
     compute_group_normalized_reward,
     grpo_microbatch_train_step,
-    gradient_clipping
+    compute_grpo_clip_loss
 )
 
 
@@ -337,7 +337,7 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
 
     # TODO: Define training prompts
     base_prompt = "Generate a story that includes "
-    with open("hw3/assignment3-rl/cse599o_alignment/prompts.txt", "r") as f:
+    with open("/homes/iws/jiexiao/cse599o/hw3/assignment3-rl/cse599o_alignment/prompts/keywords.txt", "r") as f:
         keywords = [line.strip() for line in f.readlines()]
     prompts = [base_prompt + kw for kw in keywords]
 
