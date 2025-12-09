@@ -47,7 +47,43 @@ def compute_group_normalized_reward(
         
         metadata: your choice of other statistics to log (e.g. mean, std, max/min of rewards).
     """
-    pass
+
+    ## Get the raw rewards 
+    advantage = []
+    raw_rewards = []
+
+    rollout_batch_size = len(rollout_responses)
+    num_prompts = rollout_batch_size // group_size
+    
+    for response, gt in zip(rollout_responses, repeated_ground_truths):
+        r = reward_fn(response, gt)
+        raw_rewards.append(r["reward"])
+    
+    for i in range(num_prompts):
+        group_rewards = raw_rewards[i*group_size:(i+1)*group_size]
+        group_mean = sum(group_rewards) / group_size
+        if normalized_by_std:
+            variance = sum((r - group_mean) ** 2 for r in group_rewards) / (group_size - 1)
+            group_std = variance ** 0.5
+            denom = group_std + advantage_eps
+        else:
+            denom = 1.0
+        
+        for r in group_rewards:
+            adv = (r - group_mean) / denom
+            advantage.append(adv)
+
+    advantages = torch.tensor(advantage, dtype=torch.float32)
+    raw_rewards_tensor = torch.tensor(raw_rewards, dtype=torch.float32)
+
+    metadata = {
+        "mean_reward": raw_rewards_tensor.mean().item(),
+        "max_reward": raw_rewards_tensor.max().item(),
+        "min_reward": raw_rewards_tensor.min().item(),
+        "std_reward": raw_rewards_tensor.std().item()
+    }
+
+    return advantages, raw_rewards_tensor, metadata
 
 def compute_grpo_clip_loss(
     advantages: torch.Tensor,
@@ -79,7 +115,23 @@ def compute_grpo_clip_loss(
         token was clipped or not, i.e., whether the clipped policy gradient loss on the RHS of
         the min was lower than the LHS.
     """
-    pass
+
+    log_multiplier = torch.exp(policy_log_probs - old_log_probs)
+
+    # broadcast advantages to match policy_log_probs shape
+    advantages = repeat(advantages, 'b 1 -> b s', s=policy_log_probs.shape[1])
+
+    unclipped_loss = log_multiplier * advantages
+
+    clipped_log_multiplier = torch.clamp(log_multiplier, 1 - cliprange, 1 + cliprange)
+    clipped_loss = clipped_log_multiplier * advantages
+
+    loss = -torch.min(unclipped_loss, clipped_loss)
+
+    metadata = {}
+
+    return loss, metadata
+
 
 def masked_mean(
     tensor: torch.Tensor,
@@ -100,7 +152,12 @@ def masked_mean(
     Returns:
         torch.Tensor The masked mean; shape matches tensor.mean(dim) semantics.
     """
-    pass
+    
+    masked_tensor = tensor * mask
+    sum_masked = masked_tensor.sum(dim=dim)
+    count_masked = mask.sum(dim=dim)
+    mean_masked = sum_masked / count_masked
+    return mean_masked
 
 
 def grpo_microbatch_train_step(
@@ -144,5 +201,19 @@ def grpo_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
         might want to log.
     """
-    pass
+    
+    loss, _ = compute_grpo_clip_loss(
+        advantages,
+        policy_log_probs,
+        old_log_probs,
+        cliprange,
+    )
 
+    masked_mean_loss = masked_mean(loss, response_mask) / gradient_accumulation_steps
+    masked_mean_loss.backward()
+
+    metadata = {
+        "microbatch_loss": masked_mean_loss.item()
+    }
+
+    return masked_mean_loss, metadata
