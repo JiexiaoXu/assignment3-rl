@@ -80,7 +80,7 @@ def generate_text(
     max_gen_length: int,
     temperature: float,
     top_p_threshold: float,
-) -> tuple[str, torch.Tensor, torch.Tensor]:
+) -> tuple[str, torch.Tensor]:
     def temperature_softmax(logits, temperature):
         logits = logits / max(temperature, 1e-8)
         return torch.softmax(logits, dim=-1)
@@ -136,9 +136,17 @@ def generate_text(
 
         # Decode the generated text
         generated_text = tokenizer.decode(accum_output.tolist())
-        response_len = len(accum_output) - len(tokenizer.encode(prompt))
         response_log_probs = torch.stack(log_probs) if log_probs else torch.tensor([], device=accum_output.device)
-    return generated_text, accum_output, response_log_probs
+    return generated_text, response_log_probs
+
+
+def KL_divergence(new_log_probs: torch.Tensor, ref_log_probs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Compute KL divergence D_KL(P || Q) where P and Q are distributions defined by log_probs."""
+    kl_per_token = (new_log_probs - ref_log_probs)
+    # mask and average
+    kl_sum = (kl_per_token * mask).sum()
+    tok_count = mask.sum().clamp_min(1.0)
+    return kl_sum / tok_count
 
 # ===================== Data container =====================
 
@@ -150,7 +158,7 @@ class Trajectory:
         prompts: List[str],  # shape: [G]
         responses: List[str],  # shape: [G]
         rewards: torch.Tensor,  # shape: [G]
-        log_probs: List[torch.Tensor],  # per-response token log-probs
+        log_probs: List[torch.Tensor],  # per-response token log-probs shape: [G][seq_len]
         values: Optional[torch.Tensor] = None,  # shape: [G]
     ):
         self.prompts = prompts
@@ -168,7 +176,7 @@ class Generator:
     def __init__(self):
         self.device = get_device()
         # TODO: Initialize the TransformerLM model
-        self.model = TransformerLM(
+        self.actor_model = TransformerLM(
             vocab_size=VOCAB_SIZE,
             context_length=CONTEXT_LENGTH,
             num_layers=NUM_LAYERS,
@@ -179,7 +187,7 @@ class Generator:
             dtype=torch.float32,
             device=self.device,
         )
-        load_checkpoint(CHECKPOINT_PATH, self.model, None)
+        load_checkpoint(CHECKPOINT_PATH, self.actor_model, None)
         self.tokenizer = tiktoken.get_encoding("gpt2")
 
     def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
@@ -201,9 +209,9 @@ class Generator:
             log_probs = []
             rewards = []
             for _ in range(G):
-                response, token_ids, resp_log_probs = generate_text(
+                response, resp_log_probs = generate_text(
                     prompt=prompt,
-                    model=self.model,
+                    model=self.actor_model,
                     tokenizer=self.tokenizer,
                     context_length=CONTEXT_LENGTH,
                     max_gen_length=SAMPLING_MAX_TOKENS,
@@ -231,7 +239,7 @@ class Learner:
     def __init__(self):
         self.device = get_device()
         # TODO: Initialize the same TransformerLM model as Generator
-        self.model = TransformerLM(
+        self.learner_model = TransformerLM(
             vocab_size=VOCAB_SIZE,
             context_length=CONTEXT_LENGTH,
             num_layers=NUM_LAYERS,
@@ -242,17 +250,16 @@ class Learner:
             dtype=torch.float32,
             device=self.device,
         )
-        load_checkpoint(CHECKPOINT_PATH, self.model, None)
+        load_checkpoint(CHECKPOINT_PATH, self.learner_model, None)
         self.optimizer = AdamW(
-            self.model.parameters(),
+            self.learner_model.parameters(),
             lr=LEARNING_RATE,
             weight_decay=0.01,
         )
 
-    def _compute_response_log_probs(
+    def compute_response_log_probs(
         self, prompt: str, response: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute per-token log-probabilities for the response portion."""
         prompt_ids = self.tokenizer.encode(prompt)
         response_ids = self.tokenizer.encode(response)
         all_ids = prompt_ids + response_ids
@@ -264,7 +271,7 @@ class Learner:
         input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
         target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
 
-        logits = self.model(input_ids)
+        logits = self.learner_model(input_ids)
         log_probs_all = torch.log_softmax(logits, dim=-1)
         token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
 
@@ -306,28 +313,30 @@ class Learner:
         # 3. Perform optimizer step
         # 4. Return loss value
 
+        def pad_to_len(t: torch.Tensor, length: int) -> torch.Tensor:
+            if t.numel() == length:
+                return t
+            return F.pad(t, (0, length - t.numel()))
+
         if not trajectories:
             return 0.0
 
+        # Compute Advantages
         advantages = self.compute_advantages(trajectories)
 
         policy_log_probs_list = []
         old_log_probs_list = []
         response_masks = []
 
+        # Compute new log probs
         for traj in trajectories:
             for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
-                policy_lp, mask = self._compute_response_log_probs(prompt, response)
+                policy_lp, mask = self.compute_response_log_probs(prompt, response)
                 policy_log_probs_list.append(policy_lp)
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
 
         max_len = max(lp.shape[0] for lp in policy_log_probs_list)
-
-        def pad_to_len(t: torch.Tensor, length: int) -> torch.Tensor:
-            if t.numel() == length:
-                return t
-            return F.pad(t, (0, length - t.numel()))
 
         policy_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in policy_log_probs_list])
         old_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in old_log_probs_list])
@@ -344,7 +353,6 @@ class Learner:
             cliprange=0.2,
         )
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
         return float(loss.item())
@@ -356,19 +364,61 @@ class Learner:
 class ColocatedWorker(Generator, Learner):
     """Combined Generator and Learner in a single Ray actor."""
     def __init__(self):
+        self.fronzen_model = TransformerLM(
+            vocab_size=VOCAB_SIZE,
+            context_length=CONTEXT_LENGTH,
+            num_layers=NUM_LAYERS,
+            d_model=D_MODEL,
+            num_heads=NUM_HEADS,
+            d_ff=D_FF,
+            theta=THETA,
+            dtype=torch.float32,
+            device=get_device(),
+        )
+        self.fronzen_model.eval()
+        for param in self.fronzen_model.parameters():
+            param.requires_grad = False
+
         Generator.__init__(self)
         Learner.__init__(self)
         self.step_count = 0
+        self.gen_times = []
+        self.learn_times = []
+        self.sync_times = []
+
     
     def training_step(self, prompts: List[str]) -> Dict[str, Any]:
         """Perform one complete training step: generate rollout + update policy."""
         # Generate trajectories for the batch of prompts
+        gen_start = torch.cuda.Event(enable_timing=True)
+        gen_end = torch.cuda.Event(enable_timing=True)
+        learn_start = torch.cuda.Event(enable_timing=True)
+        learn_end = torch.cuda.Event(enable_timing=True)
+        sync_start = torch.cuda.Event(enable_timing=True)
+        sync_end = torch.cuda.Event(enable_timing=True)
+    
+        gen_start.record()
         trajectories = self.generate_trajectories(prompts)
+        gen_end.record()
+        torch.cuda.synchronize()
+        self.gen_times.append(gen_start.elapsed_time(gen_end))
+
         
         # Update policy using GRPO
+        learn_start.record()
         loss = self.update_policy(trajectories)
-        
+        learn_end.record()
+        torch.cuda.synchronize()
+        self.learn_times.append(learn_start.elapsed_time(learn_end))
+
         self.step_count += 1
+
+        # Weight Synchronization 
+        sync_start.record()
+        self.actor_model.load_state_dict(self.learner_model.state_dict())
+        sync_end.record()
+        torch.cuda.synchronize()
+        self.sync_times.append(sync_start.elapsed_time(sync_end))
         
         return {
             'step': self.step_count,
@@ -381,7 +431,10 @@ class ColocatedWorker(Generator, Learner):
         """Get current training statistics."""
         return {
             'step_count': self.step_count,
-            'model_parameters': sum(p.numel() for p in self.model.parameters()) if hasattr(self, 'model') else 0
+            'model_parameters': sum(p.numel() for p in self.actor_model.parameters()) if hasattr(self, 'model') else 0,
+            'avg_gen_time_ms': np.mean(self.gen_times) if self.gen_times else 0.0,
+            'avg_learn_time_ms': np.mean(self.learn_times) if self.learn_times else 0.0,
+            'avg_sync_time_ms': np.mean(self.sync_times) if self.sync_times else 0.0,
         }
 
 
@@ -407,6 +460,14 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
             prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
             result = ray.get(worker.training_step.remote(prompt_batch))
             print(f"Worker Step {result['step']}: Loss={result['loss']:.4f}, Avg Reward={result['avg_reward']:.4f}")
+
+        worker_stats = ray.get([w.get_statistics.remote() for w in workers])
+        print("Worker Statistics:")
+        for i, stats in enumerate(worker_stats):
+            print(f" Worker {i}: Steps={stats['step_count']}, Params={stats['model_parameters']}, "
+                  f"Avg Gen Time={stats['avg_gen_time_ms']:.2f}ms, "
+                  f"Avg Learn Time={stats['avg_learn_time_ms']:.2f}ms, "
+                  f"Avg Sync Time={stats['avg_sync_time_ms']:.2f}ms")
 
 
 def run_once(num_steps: int = 10, num_workers: int = 1):
