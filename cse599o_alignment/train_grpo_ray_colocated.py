@@ -175,7 +175,7 @@ class Generator:
             num_layers=NUM_LAYERS,
             d_model=D_MODEL,
             num_heads=NUM_HEADS,
-            d_ff=D_FF,
+            dff=D_FF,
             theta=THETA,
             dtype=torch.float32,
             device=self.device,
@@ -365,7 +365,18 @@ if __name__ == "__main__":
                        help="Number of colocated workers")
     args = parser.parse_args()
     
-    ray.init(ignore_reinit_error=True)
+    ray.init(
+        ignore_reinit_error=True,
+        runtime_env={
+            "working_dir": ".", 
+            "excludes": [
+                ".venv",        
+                ".git",         
+                "__pycache__",
+                "tests/fixtures" 
+            ]
+        }
+    )
     
     try:
         run_once(num_steps=args.steps, num_workers=args.workers)
