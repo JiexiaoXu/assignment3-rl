@@ -178,14 +178,18 @@ def compute_response_log_probs(
         scaled = step_logits / max(temperature, 1e-8)
         probs = torch.softmax(scaled, dim=-1)
         if top_p_threshold < 1.0:
-            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            masked_probs = probs.clone()
+
+            sorted_probs, sorted_idx = torch.sort(masked_probs, descending=True)
             cumulative = torch.cumsum(sorted_probs, dim=-1)
             to_remove = cumulative > top_p_threshold
             to_remove[..., 1:] = to_remove[..., :-1].clone()
             to_remove[..., 0] = False
-            probs[sorted_idx[to_remove]] = 0.0
-            probs = probs / probs.sum(dim=-1, keepdim=True)
-        return torch.log(probs[target_token] + 1e-8)
+            masked_probs[sorted_idx[to_remove]] = 0.0
+            masked_probs = masked_probs / masked_probs.sum(dim=-1, keepdim=True)
+        else:
+            masked_probs = probs
+        return torch.log(masked_probs[target_token] + 1e-8)
 
     token_log_probs = []
     for step in range(target_ids.shape[1]):
@@ -341,7 +345,7 @@ class Learner:
 
         return torch.tensor(advantage_list, device=self.device)
     
-    def update_policy(self, trajectories: List[Trajectory], k=1) -> float:
+    def update_policy(self, trajectories: List[Trajectory]) -> float:
         """Perform one policy update step."""
         # TODO: Implement GRPO/PPO policy update
         # 1. Compute advantages
@@ -399,7 +403,7 @@ class Learner:
         loss, _ = grpo_microbatch_train_step(
             policy_log_probs=policy_log_probs,
             response_mask=response_mask,
-            gradient_accumulation_steps=k,
+            gradient_accumulation_steps=1,
             loss_type=LOSS_TYPE,
             advantages=advantages.unsqueeze(-1).to(self.device),
             old_log_probs=old_log_probs,
@@ -442,25 +446,29 @@ class ColocatedWorker(Generator, Learner):
         learn_end = torch.cuda.Event(enable_timing=True)
         sync_start = torch.cuda.Event(enable_timing=True)
         sync_end = torch.cuda.Event(enable_timing=True)
-    
+
+        rollout_batches = []
         gen_start.record()
-        trajectories = self.generate_trajectories(prompts)
+        for _ in range(k):
+            trajectories = self.generate_trajectories(prompts)
+            rollout_batches.append(trajectories)
         gen_end.record()
         torch.cuda.synchronize()
         self.gen_times.append(gen_start.elapsed_time(gen_end))
 
         
         # Update policy using GRPO
+        num_samples_step = 0
         learn_start.record()
-        loss, kl_value = self.update_policy(trajectories, k=k)
+        for trajectories in rollout_batches:
+            loss, kl_value = self.update_policy(trajectories)
+            for traj in trajectories:
+                # each response in traj.responses is one sample
+                num_samples_step += len(traj.responses)
         learn_end.record()
         torch.cuda.synchronize()
         self.learn_times.append(learn_start.elapsed_time(learn_end))
 
-        num_samples_step = 0
-        for traj in trajectories:
-            # each response in traj.responses is one sample
-            num_samples_step += len(traj.responses)
 
         # Weight Synchronization 
         sync_start.record()
@@ -516,7 +524,7 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
         for worker in workers:
             # Sample a batch of prompts for each worker
             prompt_batch = np.random.choice(prompts, size=4, replace=False).tolist()
-            result = ray.get(worker.training_step.remote(prompt_batch, k=1))
+            result = ray.get(worker.training_step.remote(prompt_batch, k=8))
 
             if step != 0 and step % 2 == 0:
 

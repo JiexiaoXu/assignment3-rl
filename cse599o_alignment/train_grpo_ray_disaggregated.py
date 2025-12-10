@@ -181,6 +181,8 @@ class Learner:
         self.version = 0
         self.replay_buf = replay_buf
 
+        self.step_time = []
+
     def step(self):
         """One GRPO/PPO-style update step."""
         # TODO: sample from replay buffer, compute advantages, update model
@@ -190,6 +192,8 @@ class Learner:
 
         if not sampled_trajectories:
             return 0.0
+        
+        start = time.time()
 
         old_log_probs_list: List[torch.Tensor] = []
         policy_log_probs_list: List[torch.Tensor] = []
@@ -249,6 +253,10 @@ class Learner:
         self.optimizer.step()
 
         self.version += 1
+
+        end = time.time()
+        self.step_time.append(end - start)
+
         return float(loss.item())
 
     def get_weights(self):
@@ -257,6 +265,11 @@ class Learner:
 
     def get_version(self):
         return self.version
+    
+    def get_avg_step_time(self):
+        if not self.step_time:
+            return 0.0
+        return sum(self.step_time) / len(self.step_time)
 
 
 @ray.remote
@@ -280,10 +293,14 @@ class Generator:
         self.tokenizer = get_tokenizer()
         self.traj_q = traj_q
         self.version = 0
+        self.gen_time = []
+        self.sync_time = []
 
     def generate(self, prompts: List[str]):
         """Generate text responses and send to Scorer."""
         from cse599o_alignment.train_grpo_ray_colocated import generate_text
+
+        start = time.time()
 
         for prompt in prompts:
             prompt_group = [prompt] * G
@@ -312,15 +329,29 @@ class Generator:
             )
             self.traj_q.put.remote(trajectory)
 
+        end = time.time()
+        self.gen_time.append(end - start)
+
 
     def update(self, weights: Dict, version: int):
         """Load updated learner weights."""
         # TODO: Update model weights from learner
+        start = time.time()
         sd = self.actor_model.state_dict()
         for n, w in weights.items():
             sd[n] = w.to(self.device)
         self.actor_model.load_state_dict(sd)
         self.version = version
+        end = time.time()
+        self.sync_time.append(end - start)
+
+    def get_stats(self):
+        if not self.gen_time or not self.sync_time:
+            return 0.0, 0.0
+        avg_gen_time = sum(self.gen_time) / len(self.gen_time)
+        avg_sync_time = sum(self.sync_time) / len(self.sync_time)
+        return avg_gen_time, avg_sync_time
+            
 
 
 # ===================== Training loop =====================
@@ -359,6 +390,11 @@ def run_training(num_steps: int = 3):
         version = ray.get(learner.get_version.remote())
         generator.update.remote(weights, version)
         print(f"[Step {step+1}] Loss={loss:.4f}, Version={version}")
+
+        if step % 2 == 0:
+            avg_gen_time, avg_sync_time = ray.get(generator.get_stats.remote())
+            avg_learn_time = ray.get(learner.get_avg_step_time.remote())
+            print(f"  Avg Gen Time: {avg_gen_time:.4f}s, Avg Sync Time: {avg_sync_time:.4f}s, Avg Learn Time: {avg_learn_time:.4f}s")
 
     scorer.stop.remote()
 
