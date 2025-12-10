@@ -122,6 +122,9 @@ class ReplayBuffer:
         indices = np.random.choice(len(valid_traj), size=k, replace=False)
         return [valid_traj[i] for i in indices]
 
+    def size(self) -> int:
+        return len(self.data)
+
 
 @ray.remote
 class Scorer:
@@ -211,7 +214,7 @@ class Learner:
             else:
                 denom = torch.tensor(1.0, device=self.device)
 
-            for idx, (prompt, response, old_lp) in enumerate(zip(traj.prompts, traj.responses, traj.log_probs)):
+            for reward, prompt, response, old_lp in zip(rewards, traj.prompts, traj.responses, traj.log_probs):
                 policy_lp, mask = compute_response_log_probs(
                     prompt,
                     response,
@@ -222,10 +225,12 @@ class Learner:
                 policy_log_probs_list.append(policy_lp)
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
-                adv = (rewards[idx] - group_mean) / denom
+                adv = (reward - group_mean) / denom
                 advantages_list.append(adv.item())
 
         advantages = torch.tensor(advantages_list, device=self.device)
+        if policy_log_probs_list == []:
+            return 0.0
 
         # Update Policy
         max_len = max(lp.shape[0] for lp in policy_log_probs_list)
@@ -272,7 +277,7 @@ class Learner:
         return sum(self.step_time) / len(self.step_time)
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class Generator:
     """Generates text responses using TransformerLM policy."""
     def __init__(self, traj_q):
@@ -346,10 +351,8 @@ class Generator:
         self.sync_time.append(end - start)
 
     def get_stats(self):
-        if not self.gen_time or not self.sync_time:
-            return 0.0, 0.0
-        avg_gen_time = sum(self.gen_time) / len(self.gen_time)
-        avg_sync_time = sum(self.sync_time) / len(self.sync_time)
+        avg_gen_time = sum(self.gen_time) / len(self.gen_time) if self.gen_time else 0.0
+        avg_sync_time = sum(self.sync_time) / len(self.sync_time) if self.sync_time else 0.0
         return avg_gen_time, avg_sync_time
             
 
@@ -378,13 +381,22 @@ def run_training(num_steps: int = 3):
     # Populate the buffer
     prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
     generator.generate.remote(prompt_batch)
+    # wait until scorer has placed something in replay buffer
+    while ray.get(replay_buf.size.remote()) == 0:
+        time.sleep(0.05)
 
     for step in range(num_steps):
         next_prompt = np.random.choice(prompts, size=2, replace=False).tolist()
         generator.generate.remote(next_prompt)
 
         # Learner update
-        loss = ray.get(learner.step.remote())
+        loss = 0.0
+        # ensure learner has data; retry if buffer temporarily empty
+        while True:
+            loss = ray.get(learner.step.remote())
+            if loss != 0.0:
+                break
+            time.sleep(0.05)
 
         weights = ray.get(learner.get_weights.remote())
         version = ray.get(learner.get_version.remote())
