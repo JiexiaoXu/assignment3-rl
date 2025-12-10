@@ -140,13 +140,28 @@ def generate_text(
     return generated_text, response_log_probs
 
 
-def KL_divergence(new_log_probs: torch.Tensor, ref_log_probs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Compute KL divergence D_KL(P || Q) where P and Q are distributions defined by log_probs."""
-    kl_per_token = (new_log_probs - ref_log_probs)
-    # mask and average
-    kl_sum = (kl_per_token * mask).sum()
-    tok_count = mask.sum().clamp_min(1.0)
-    return kl_sum / tok_count
+def compute_response_log_probs(
+        self, prompt: str, response: str, model: TransformerLM
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_ids = self.tokenizer.encode(prompt)
+        response_ids = self.tokenizer.encode(response)
+        all_ids = prompt_ids + response_ids
+
+        if len(all_ids) < 2:
+            empty = torch.zeros(1, device=self.device)
+            return empty, empty
+
+        input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
+        target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
+
+        logits = model(input_ids)
+        log_probs_all = torch.log_softmax(logits, dim=-1)
+        token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
+
+        response_start = max(len(prompt_ids) - 1, 0)
+        response_log_probs = token_log_probs[:, response_start:]
+        response_mask = torch.ones_like(response_log_probs, dtype=torch.float32)
+        return response_log_probs.squeeze(0), response_mask.squeeze(0)
 
 # ===================== Data container =====================
 
@@ -257,30 +272,6 @@ class Learner:
             weight_decay=0.01,
         )
 
-    def compute_response_log_probs(
-        self, prompt: str, response: str, model: Optional[TransformerLM] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        prompt_ids = self.tokenizer.encode(prompt)
-        response_ids = self.tokenizer.encode(response)
-        all_ids = prompt_ids + response_ids
-        model = model if model is not None else self.learner_model
-
-        if len(all_ids) < 2:
-            empty = torch.zeros(1, device=self.device)
-            return empty, empty
-
-        input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
-        target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
-
-        logits = model(input_ids)
-        log_probs_all = torch.log_softmax(logits, dim=-1)
-        token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
-
-        response_start = max(len(prompt_ids) - 1, 0)
-        response_log_probs = token_log_probs[:, response_start:]
-        response_mask = torch.ones_like(response_log_probs, dtype=torch.float32)
-        return response_log_probs.squeeze(0), response_mask.squeeze(0)
-
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
         # TODO: Implement GRPO advantage computation
@@ -333,10 +324,10 @@ class Learner:
         # Compute new log probs
         for traj in trajectories:
             for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
-                policy_lp, mask = self.compute_response_log_probs(prompt, response)
+                policy_lp, mask = compute_response_log_probs(prompt, response, self.learner_model)
                 policy_log_probs_list.append(policy_lp)
                 with torch.no_grad():
-                    ref_lp, _ = self.compute_response_log_probs(prompt, response, model=self.fronzen_model)
+                    ref_lp, _ = compute_response_log_probs(prompt, response, self.fronzen_model)
                     ref_log_probs_list.append(ref_lp.to(self.device))
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
@@ -381,7 +372,7 @@ class ColocatedWorker(Generator, Learner):
             num_layers=NUM_LAYERS,
             d_model=D_MODEL,
             num_heads=NUM_HEADS,
-            d_ff=D_FF,
+            dff=D_FF,
             theta=THETA,
             dtype=torch.float32,
             device=get_device(),

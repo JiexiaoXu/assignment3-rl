@@ -29,7 +29,7 @@ from cse599o_alignment.grpo import (
     grpo_microbatch_train_step,
     compute_grpo_clip_loss
 )
-from cse599o_alignment.grpo import keyword_inclusion_reward_fn
+from cse599o_alignment.train_grpo_ray_colocated import keyword_inclusion_reward_fn, compute_response_log_probs
 
 
 
@@ -85,19 +85,17 @@ class Trajectory:
 class TrajectoryQueue:
     """Buffer between Generator and Scorer."""
     def __init__(self):
-        self.q = asyncio.Queue()
+        self.q = list[Trajectory]
 
     def put(self, traj: Trajectory):
         # TODO: implement trajectory queuing
-        self.q.put_nowait(traj)
+        self.q.append(traj)
 
     def get(self):
         # TODO: implement trajectory retrieval with timeout
-        timeout = 5.0  # seconds
-        try:
-            return asyncio.wait_for(self.q.get(), timeout)
-        except asyncio.TimeoutError:
+        if len(self.q) == 0:
             return None
+        return self.q.pop(0)
 
 
 @ray.remote
@@ -112,9 +110,11 @@ class ReplayBuffer:
 
     def sample(self, k: int):
         # TODO: sample k trajectories for training
+        if len(self.data) == 0:
+            return []
+        k = min(k, len(self.data))
         indices = np.random.choice(len(self.data), size=k, replace=False)
-        sampled = [self.data[i] for i in indices]
-        return sampled
+        return [self.data[i] for i in indices]
 
 
 @ray.remote
@@ -132,12 +132,16 @@ class Scorer:
             # TODO: Get trajectories from queue, compute rewards, store in replay buffer
             # This should implement a reward function that evaluates text quality
             # e.g., keyword inclusion, safety, helpfulness, etc.
-            traj = ray.get(self.traj_q.get())
+            traj = ray.get(self.traj_q.get().remote())
+            if traj is None:
+                asyncio.sleep(0.1)
+                continue
+
             for prompt, response in zip(traj.prompts, traj.responses):
                 keyword = prompt.strip().split()[-1]
                 reward = keyword_inclusion_reward_fn(response, keyword)
                 traj.rewards.append(reward)
-            self.replay_buf.put(traj)
+            self.replay_buf.put.remote(traj)
             
 
     def stop(self):
@@ -174,14 +178,26 @@ class Learner:
         # TODO: sample from replay buffer, compute advantages, update model
         # This should implement GRPO policy gradient updates for text generation
         sampled_trajectories = ray.get(self.replay_buf.sample.remote(k=8))
+
+        if not sampled_trajectories:
+            return 0.0
+
         rollout_responses: List[str] = []
         repeated_ground_truths: List[List[str]] = []
+        old_log_probs_list: List[torch.Tensor] = []
+        policy_log_probs_list: List[torch.Tensor] = []
+        response_masks: List[torch.Tensor] = []
 
+        # Compute advantages
         for traj in sampled_trajectories:
-            for prompt, response in zip(traj.prompts, traj.responses):
+            for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
                 rollout_responses.append(response)
                 keyword = prompt.strip().split()[-1]
                 repeated_ground_truths.append([keyword])
+                policy_lp, mask = compute_response_log_probs(prompt, response, self.learner_model)
+                policy_log_probs_list.append(policy_lp)
+                response_masks.append(mask)
+                old_log_probs_list.append(old_lp.to(self.device))
 
         advantages, _, _ = compute_group_normalized_reward(
             rollout_responses=rollout_responses,
@@ -192,9 +208,31 @@ class Learner:
             advantage_eps=ADVANTAGE_EPS,
         )
 
+        # Update Policy
+        max_len = max(lp.shape[0] for lp in policy_log_probs_list)
 
+        def pad_to_len(t: torch.Tensor, length: int) -> torch.Tensor:
+            if t.numel() == length:
+                return t
+            return torch.nn.functional.pad(t, (0, length - t.numel()))
 
-        loss = torch.tensor(0.0, device=self.device)
+        policy_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in policy_log_probs_list])
+        old_log_probs = torch.stack([pad_to_len(lp, max_len) for lp in old_log_probs_list])
+        response_mask = torch.stack([pad_to_len(mask, max_len) for mask in response_masks])
+
+        self.optimizer.zero_grad()
+        loss, _ = grpo_microbatch_train_step(
+            policy_log_probs=policy_log_probs,
+            response_mask=response_mask,
+            gradient_accumulation_steps=1,
+            loss_type=LOSS_TYPE,
+            advantages=advantages.unsqueeze(-1).to(self.device),
+            old_log_probs=old_log_probs,
+            cliprange=0.2,
+        )
+        torch.nn.utils.clip_grad_norm_(self.learner_model.parameters(), 1.0)
+        self.optimizer.step()
+
         self.version += 1
         return float(loss.item())
 
@@ -233,11 +271,9 @@ class Generator:
         from cse599o_alignment.train_grpo_ray_colocated import generate_text
 
         for prompt in prompts:
-            keyword = prompt.strip().split()[-1]
             prompt_group = [prompt] * G
             responses = []
             log_probs = []
-            rewards = []
             for _ in range(G):
                 response, resp_log_probs = generate_text(
                     prompt=prompt,
@@ -255,12 +291,11 @@ class Generator:
             trajectory = Trajectory(
                 prompts=prompt_group,
                 responses=responses,
-                rewards=[],
+                rewards=torch.zeros(G),  # placeholder, to be filled by Scorer
                 log_probs=[lp.detach() for lp in log_probs],
             )
-            self.traj_q.put(trajectory)
+            self.traj_q.put.remote(trajectory)
 
-        
 
     def update(self, weights: Dict, version: int):
         """Load updated learner weights."""
@@ -283,7 +318,27 @@ def run_training(num_steps: int = 3):
     generator = Generator.remote(traj_q)
 
     # TODO: Driver code for the training loop
-    pass
+    # Define training prompts
+    base_prompt = "Generate a story that includes "
+    from pathlib import Path
+    keywords_path = Path(__file__).resolve().parent / "prompts" / "keywords.txt"
+    with open(keywords_path, "r") as f:
+        keywords = [line.strip() for line in f.readlines()]
+    prompts = [base_prompt + kw for kw in keywords]
+
+    scorer.run.remote()
+    for step in range(num_steps):
+        prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
+        generator.generate.remote(prompt_batch)
+        time.sleep(0.1)
+        # Learner update
+        loss = ray.get(learner.step.remote())
+        weights = ray.get(learner.get_weights.remote())
+        version = ray.get(learner.get_version.remote())
+        generator.update.remote(weights, version)
+        print(f"[Step {step+1}] Loss={loss:.4f}, Version={version}")
+
+    scorer.stop.remote()
 
 
 def run_once(num_steps: int = 3):
