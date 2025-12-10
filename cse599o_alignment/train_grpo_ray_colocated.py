@@ -524,7 +524,7 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
         for worker in workers:
             # Sample a batch of prompts for each worker
             prompt_batch = np.random.choice(prompts, size=4, replace=False).tolist()
-            result = ray.get(worker.training_step.remote(prompt_batch, k=8))
+            result = ray.get(worker.training_step.remote(prompt_batch, k=2))
 
             if step != 0 and step % 2 == 0:
 
@@ -546,7 +546,10 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
 
 def run_once(num_steps: int = 10, num_workers: int = 1):
     """Entry point for training."""
+    start = time.time()
     run_training(num_steps, num_workers)
+    end = time.time()
+    print(f"Total training time for {num_steps} steps with {num_workers} workers: {end - start:.2f} seconds")
 
 
 # ===================== Entry point =====================

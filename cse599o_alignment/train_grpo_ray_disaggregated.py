@@ -379,14 +379,14 @@ def run_training(num_steps: int = 3):
     scorer.run.remote()
 
     # Populate the buffer
-    prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
+    prompt_batch = np.random.choice(prompts, size=4, replace=False).tolist()
     generator.generate.remote(prompt_batch)
     # wait until scorer has placed something in replay buffer
     while ray.get(replay_buf.size.remote()) == 0:
         time.sleep(0.05)
 
     for step in range(num_steps):
-        next_prompt = np.random.choice(prompts, size=2, replace=False).tolist()
+        next_prompt = np.random.choice(prompts, size=4, replace=False).tolist()
         generator.generate.remote(next_prompt)
 
         # Learner update
@@ -413,7 +413,10 @@ def run_training(num_steps: int = 3):
 
 def run_once(num_steps: int = 3):
     """Entry point for training."""
+    start = time.time()
     run_training(num_steps)
+    end = time.time()
+    print(f"Total training time for {num_steps} steps: {end - start:.2f} seconds")
 
 
 
