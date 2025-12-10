@@ -52,6 +52,7 @@ SAMPLING_MAX_TOKENS: int = 60
 ADVANTAGE_EPS: float = 1e-8
 LOSS_TYPE: str = "grpo_clip"
 USE_STD_NORMALIZATION: bool = True
+SAMPLING_TOP_P: float = 0.9
 
 
 def get_device():
@@ -190,31 +191,37 @@ class Learner:
         if not sampled_trajectories:
             return 0.0
 
-        rollout_responses: List[str] = []
-        repeated_ground_truths: List[List[str]] = []
         old_log_probs_list: List[torch.Tensor] = []
         policy_log_probs_list: List[torch.Tensor] = []
         response_masks: List[torch.Tensor] = []
+        advantages_list: List[float] = []
 
-        # Compute advantages
         for traj in sampled_trajectories:
-            for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
-                rollout_responses.append(response)
-                keyword = prompt.strip().split()[-1]
-                repeated_ground_truths.append([keyword])
-                policy_lp, mask = compute_response_log_probs(prompt, response, self.learner_model)
+            rewards = traj.rewards.to(self.device)
+            if rewards.numel() == 0:
+                continue
+            group_mean = rewards.mean()
+            if USE_STD_NORMALIZATION and rewards.numel() > 1:
+                group_std = rewards.std(unbiased=True)
+                denom = group_std + ADVANTAGE_EPS
+            else:
+                denom = torch.tensor(1.0, device=self.device)
+
+            for idx, (prompt, response, old_lp) in enumerate(zip(traj.prompts, traj.responses, traj.log_probs)):
+                policy_lp, mask = compute_response_log_probs(
+                    prompt,
+                    response,
+                    self.learner_model,
+                    temperature=SAMPLING_TEMPERATURE,
+                    top_p_threshold=SAMPLING_TOP_P,
+                )
                 policy_log_probs_list.append(policy_lp)
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
+                adv = (rewards[idx] - group_mean) / denom
+                advantages_list.append(adv.item())
 
-        advantages, _, _ = compute_group_normalized_reward(
-            rollout_responses=rollout_responses,
-            repeated_ground_truths=repeated_ground_truths,
-            reward_fn=keyword_inclusion_reward_fn,
-            group_size=G,
-            normalized_by_std=USE_STD_NORMALIZATION,
-            advantage_eps=ADVANTAGE_EPS,
-        )
+        advantages = torch.tensor(advantages_list, device=self.device)
 
         # Update Policy
         max_len = max(lp.shape[0] for lp in policy_log_probs_list)
@@ -252,7 +259,7 @@ class Learner:
         return self.version
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class Generator:
     """Generates text responses using TransformerLM policy."""
     def __init__(self, traj_q):
@@ -290,7 +297,7 @@ class Generator:
                     context_length=CONTEXT_LENGTH,
                     max_gen_length=SAMPLING_MAX_TOKENS,
                     temperature=SAMPLING_TEMPERATURE,
-                    top_p_threshold=0.9,
+                    top_p_threshold=SAMPLING_TOP_P,
                 )
                 responses.append(response)
                 # Store per-token log probs (old policy) for the generated response

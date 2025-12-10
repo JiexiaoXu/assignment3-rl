@@ -54,6 +54,7 @@ SAMPLING_MAX_TOKENS: int = 60
 ADVANTAGE_EPS: float = 1e-8
 LOSS_TYPE: str = "grpo_clip"
 USE_STD_NORMALIZATION: bool = True
+SAMPLING_TOP_P: float = 0.9
 
 
 def get_device():
@@ -151,29 +152,51 @@ def generate_text(
 
 
 def compute_response_log_probs(
-        prompt: str, response: str, model: TransformerLM
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = get_device()
-        tokenizer = get_tokenizer()
+    prompt: str,
+    response: str,
+    model: TransformerLM,
+    temperature: float = SAMPLING_TEMPERATURE,
+    top_p_threshold: float = SAMPLING_TOP_P,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-token log-probs of a response under a truncated distribution."""
+    device = get_device()
+    tokenizer = get_tokenizer()
 
-        prompt_ids = tokenizer.encode(prompt)
-        response_ids = tokenizer.encode(response)
-        all_ids = prompt_ids + response_ids
+    prompt_ids = tokenizer.encode(prompt)
+    response_ids = tokenizer.encode(response)
+    all_ids = prompt_ids + response_ids
 
-        if len(all_ids) < 2:
-            empty = torch.zeros(1, device=device)
-            return empty, empty
+    if len(all_ids) < 2:
+        empty = torch.zeros(1, device=device)
+        return empty, empty
 
-        input_ids = torch.tensor(all_ids[:-1], device=device, dtype=torch.long).unsqueeze(0)
-        target_ids = torch.tensor(all_ids[1:], device=device, dtype=torch.long).unsqueeze(0)
-        logits = model(input_ids)
-        log_probs_all = torch.log_softmax(logits, dim=-1)
-        token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
+    input_ids = torch.tensor(all_ids[:-1], device=device, dtype=torch.long).unsqueeze(0)
+    target_ids = torch.tensor(all_ids[1:], device=device, dtype=torch.long).unsqueeze(0)
+    logits = model(input_ids)  # (1, seq_len-1, vocab)
 
-        response_start = max(len(prompt_ids) - 1, 0)
-        response_log_probs = token_log_probs[:, response_start:]
-        response_mask = torch.ones_like(response_log_probs, dtype=torch.float32)
-        return response_log_probs.squeeze(0), response_mask.squeeze(0)
+    def filtered_log_prob(step_logits, target_token):
+        scaled = step_logits / max(temperature, 1e-8)
+        probs = torch.softmax(scaled, dim=-1)
+        if top_p_threshold < 1.0:
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            to_remove = cumulative > top_p_threshold
+            to_remove[..., 1:] = to_remove[..., :-1].clone()
+            to_remove[..., 0] = False
+            probs[sorted_idx[to_remove]] = 0.0
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+        return torch.log(probs[target_token] + 1e-8)
+
+    token_log_probs = []
+    for step in range(target_ids.shape[1]):
+        token_log_probs.append(filtered_log_prob(logits[0, step, :], target_ids[0, step]))
+
+    token_log_probs = torch.stack(token_log_probs).unsqueeze(0)  # (1, seq_len-1)
+
+    response_start = max(len(prompt_ids) - 1, 0)
+    response_log_probs = token_log_probs[:, response_start:]
+    response_mask = torch.ones_like(response_log_probs, dtype=torch.float32)
+    return response_log_probs.squeeze(0), response_mask.squeeze(0)
 
 # ===================== Data container =====================
 
@@ -243,7 +266,7 @@ class Generator:
                     context_length=CONTEXT_LENGTH,
                     max_gen_length=SAMPLING_MAX_TOKENS,
                     temperature=SAMPLING_TEMPERATURE,
-                    top_p_threshold=0.9,
+                    top_p_threshold=SAMPLING_TOP_P,
                 )
                 responses.append(response)
                 # Store per-token log probs (old policy) for the generated response
@@ -302,28 +325,21 @@ class Learner:
 
     def compute_advantages(self, trajectories: List[Trajectory]) -> torch.Tensor:
         """Compute advantages for GRPO."""
-        # TODO: Implement GRPO advantage computation
-        # This should implement the group-relative advantage computation
-        # that's central to GRPO algorithm
-        rollout_responses: List[str] = []
-        repeated_ground_truths: List[List[str]] = []
+        advantage_list: List[float] = []
 
         for traj in trajectories:
-            for prompt, response in zip(traj.prompts, traj.responses):
-                rollout_responses.append(response)
-                keyword = prompt.strip().split()[-1]
-                repeated_ground_truths.append([keyword])
+            rewards = traj.rewards.to(self.device)
+            if rewards.numel() == 0:
+                continue
+            group_mean = rewards.mean()
+            if USE_STD_NORMALIZATION and rewards.numel() > 1:
+                group_std = rewards.std(unbiased=True)
+                denom = group_std + ADVANTAGE_EPS
+            else:
+                denom = torch.tensor(1.0, device=self.device)
+            advantage_list.extend(((rewards - group_mean) / denom).tolist())
 
-        advantages, _, _ = compute_group_normalized_reward(
-            rollout_responses=rollout_responses,
-            repeated_ground_truths=repeated_ground_truths,
-            reward_fn=keyword_inclusion_reward_fn,
-            group_size=G,
-            normalized_by_std=USE_STD_NORMALIZATION,
-            advantage_eps=ADVANTAGE_EPS,
-        )
-
-        return advantages
+        return torch.tensor(advantage_list, device=self.device)
     
     def update_policy(self, trajectories: List[Trajectory], k=1) -> float:
         """Perform one policy update step."""
@@ -339,7 +355,7 @@ class Learner:
             return F.pad(t, (0, length - t.numel()))
 
         if not trajectories:
-            return 0.0
+            return 0.0, 0.0
 
         # Compute Advantages
         advantages = self.compute_advantages(trajectories)
@@ -352,10 +368,22 @@ class Learner:
         # Compute new log probs
         for traj in trajectories:
             for prompt, response, old_lp in zip(traj.prompts, traj.responses, traj.log_probs):
-                policy_lp, mask = compute_response_log_probs(prompt, response, self.learner_model)
+                policy_lp, mask = compute_response_log_probs(
+                    prompt,
+                    response,
+                    self.learner_model,
+                    temperature=SAMPLING_TEMPERATURE,
+                    top_p_threshold=SAMPLING_TOP_P,
+                )
                 policy_log_probs_list.append(policy_lp)
                 with torch.no_grad():
-                    ref_lp, _ = compute_response_log_probs(prompt, response, self.frozen_model)
+                    ref_lp, _ = compute_response_log_probs(
+                        prompt,
+                        response,
+                        self.frozen_model,
+                        temperature=SAMPLING_TEMPERATURE,
+                        top_p_threshold=SAMPLING_TOP_P,
+                    )
                     ref_log_probs_list.append(ref_lp.to(self.device))
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
@@ -424,8 +452,7 @@ class ColocatedWorker(Generator, Learner):
         
         # Update policy using GRPO
         learn_start.record()
-        for _ in range(k):
-            loss, kl_value = self.update_policy(trajectories, k=k)
+        loss, kl_value = self.update_policy(trajectories, k=k)
         learn_end.record()
         torch.cuda.synchronize()
         self.learn_times.append(learn_start.elapsed_time(learn_end))
