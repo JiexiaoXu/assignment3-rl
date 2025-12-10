@@ -45,7 +45,7 @@ D_MODEL = 512
 NUM_HEADS = 16
 D_FF = 1344
 THETA = 10000
-CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint01_step8000.pth"
+CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint.pth"
 
 N_GRPO_STEPS: int = 100
 LEARNING_RATE: float = 5e-4
@@ -58,6 +58,14 @@ USE_STD_NORMALIZATION: bool = True
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def get_tokenizer():
+    encoding = tiktoken.get_encoding("gpt2")
+    vocab = {i: encoding.decode_single_token_bytes(i) for i in range(encoding.n_vocab)}
+    merges = list(encoding._mergeable_ranks.items())
+    special_tokens = ["<|endoftext|>"]
+    tokenizer = BPETokenizer(vocab, merges, special_tokens)
+    return tokenizer
 
 def keyword_inclusion_reward_fn(response: str, keywords: List[str]) -> Dict[str, float]:
     """
@@ -141,19 +149,21 @@ def generate_text(
 
 
 def compute_response_log_probs(
-        self, prompt: str, response: str, model: TransformerLM
+        prompt: str, response: str, model: TransformerLM
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prompt_ids = self.tokenizer.encode(prompt)
-        response_ids = self.tokenizer.encode(response)
+        device = get_device()
+        tokenizer = get_tokenizer()
+
+        prompt_ids = tokenizer.encode(prompt)
+        response_ids = tokenizer.encode(response)
         all_ids = prompt_ids + response_ids
 
         if len(all_ids) < 2:
-            empty = torch.zeros(1, device=self.device)
+            empty = torch.zeros(1, device=device)
             return empty, empty
 
-        input_ids = torch.tensor(all_ids[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
-        target_ids = torch.tensor(all_ids[1:], device=self.device, dtype=torch.long).unsqueeze(0)
-
+        input_ids = torch.tensor(all_ids[:-1], device=device, dtype=torch.long).unsqueeze(0)
+        target_ids = torch.tensor(all_ids[1:], device=device, dtype=torch.long).unsqueeze(0)
         logits = model(input_ids)
         log_probs_all = torch.log_softmax(logits, dim=-1)
         token_log_probs = log_probs_all.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (1, seq_len-1)
@@ -203,7 +213,7 @@ class Generator:
             device=self.device,
         )
         load_checkpoint(CHECKPOINT_PATH, self.actor_model, None)
-        self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.tokenizer = get_tokenizer()
 
     def generate_trajectories(self, prompts: List[str]) -> List[Trajectory]:
         """
@@ -260,7 +270,7 @@ class Learner:
             num_layers=NUM_LAYERS,
             d_model=D_MODEL,
             num_heads=NUM_HEADS,
-            d_ff=D_FF,
+            dff=D_FF,
             theta=THETA,
             dtype=torch.float32,
             device=self.device,
@@ -362,7 +372,7 @@ class Learner:
 
 # ===================== Combined Actor =====================
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class ColocatedWorker(Generator, Learner):
     """Combined Generator and Learner in a single Ray actor."""
     def __init__(self):

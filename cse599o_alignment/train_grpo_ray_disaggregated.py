@@ -159,7 +159,7 @@ class Learner:
             num_layers=NUM_LAYERS,
             d_model=D_MODEL,
             num_heads=NUM_HEADS,
-            d_ff=D_FF,
+            dff=D_FF,
             theta=THETA,
             dtype=torch.float32,
             device=self.device,

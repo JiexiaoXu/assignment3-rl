@@ -103,7 +103,8 @@ def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, it
         out,
     )
 
-def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes], model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> int:
+from typing import Optional
+def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes], model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer]) -> int:
     """Load model and optimizer state from a checkpoint file.
     Returns the iteration number to resume training from.
     """
@@ -119,6 +120,7 @@ def load_checkpoint(src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
     
     # Load the cleaned state_dict
     model.load_state_dict(cleaned_state_dict)
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     iteration = checkpoint["iteration"]
     return iteration
