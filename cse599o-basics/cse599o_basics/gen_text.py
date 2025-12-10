@@ -85,7 +85,7 @@ if __name__ == "__main__":
     tokenizer = BPETokenizer(vocab, merges, special_tokens)
 
     checkpoint_path = (
-        "/local1/jiexiao/checkpoint/checkpoint01_step8000.pth"
+        "/local1/jiexiao/checkpoint/checkpoint.pth"
     )
     model = TransformerLM(
         vocab_size=encoding.n_vocab,
@@ -106,13 +106,13 @@ if __name__ == "__main__":
     load_checkpoint(checkpoint_path, model, optimizer)
 
     result_str = generate_text(
-        prompt="Once upon a time",
+        prompt="Write a story includes bags and ",
         model=model,
         tokenizer=tokenizer,  # load tokenizer
         context_length=config.model_params["context_length"],
         max_gen_length=512,
-        temperature=0.5,
-        top_p_threshold=0.5,
+        temperature=1.0,
+        top_p_threshold=0.9,
     )
     print("Generated text:")
     print(result_str)

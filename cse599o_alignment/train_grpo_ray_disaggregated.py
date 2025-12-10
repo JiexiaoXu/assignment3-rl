@@ -29,7 +29,7 @@ from cse599o_alignment.grpo import (
     grpo_microbatch_train_step,
     compute_grpo_clip_loss
 )
-from cse599o_alignment.train_grpo_ray_colocated import keyword_inclusion_reward_fn, compute_response_log_probs
+from cse599o_alignment.train_grpo_ray_colocated import keyword_inclusion_reward_fn, compute_response_log_probs, get_tokenizer
 
 
 
@@ -43,7 +43,7 @@ D_MODEL = 512
 NUM_HEADS = 16
 D_FF = 1344
 THETA = 10000
-CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint01_step8000.pth"
+CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint.pth"
 
 N_GRPO_STEPS: int = 100
 LEARNING_RATE: float = 5e-4
@@ -85,7 +85,7 @@ class Trajectory:
 class TrajectoryQueue:
     """Buffer between Generator and Scorer."""
     def __init__(self):
-        self.q = list[Trajectory]
+        self.q = []
 
     def put(self, traj: Trajectory):
         # TODO: implement trajectory queuing
@@ -108,13 +108,18 @@ class ReplayBuffer:
         # TODO: store completed trajectories here
         self.data.append(traj)
 
-    def sample(self, k: int):
+    def sample(self, k: int, version: int):
         # TODO: sample k trajectories for training
         if len(self.data) == 0:
             return []
-        k = min(k, len(self.data))
-        indices = np.random.choice(len(self.data), size=k, replace=False)
-        return [self.data[i] for i in indices]
+        
+        valid_traj = [traj for traj in self.data if 0 <= version - traj.version <= 1]
+        if len(valid_traj) == 0:
+            return []
+        
+        k = min(k, len(valid_traj))
+        indices = np.random.choice(len(valid_traj), size=k, replace=False)
+        return [valid_traj[i] for i in indices]
 
 
 @ray.remote
@@ -132,15 +137,17 @@ class Scorer:
             # TODO: Get trajectories from queue, compute rewards, store in replay buffer
             # This should implement a reward function that evaluates text quality
             # e.g., keyword inclusion, safety, helpfulness, etc.
-            traj = ray.get(self.traj_q.get().remote())
+            traj = ray.get(self.traj_q.get.remote())
             if traj is None:
-                asyncio.sleep(0.1)
+                time.sleep(0.1)
                 continue
-
+            
+            rewards = []
             for prompt, response in zip(traj.prompts, traj.responses):
                 keyword = prompt.strip().split()[-1]
-                reward = keyword_inclusion_reward_fn(response, keyword)
-                traj.rewards.append(reward)
+                reward_dict = keyword_inclusion_reward_fn(response, [keyword])
+                rewards.append(reward_dict["reward"])
+            traj.rewards = torch.tensor(rewards, dtype=torch.float32)
             self.replay_buf.put.remote(traj)
             
 
@@ -148,7 +155,7 @@ class Scorer:
         self.running = False
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class Learner:
     """Learns policy updates from the replay buffer using TransformerLM."""
     def __init__(self, replay_buf):
@@ -177,7 +184,8 @@ class Learner:
         """One GRPO/PPO-style update step."""
         # TODO: sample from replay buffer, compute advantages, update model
         # This should implement GRPO policy gradient updates for text generation
-        sampled_trajectories = ray.get(self.replay_buf.sample.remote(k=8))
+        current_version = self.version
+        sampled_trajectories = ray.get(self.replay_buf.sample.remote(k=2, version=current_version))
 
         if not sampled_trajectories:
             return 0.0
@@ -244,7 +252,7 @@ class Learner:
         return self.version
 
 
-@ray.remote
+@ray.remote(num_gpus=1)
 class Generator:
     """Generates text responses using TransformerLM policy."""
     def __init__(self, traj_q):
@@ -262,7 +270,7 @@ class Generator:
             device=self.device,
         )
         load_checkpoint(CHECKPOINT_PATH, self.actor_model, None)
-        self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.tokenizer = get_tokenizer()
         self.traj_q = traj_q
         self.version = 0
 
@@ -289,9 +297,10 @@ class Generator:
                 log_probs.append(resp_log_probs)
 
             trajectory = Trajectory(
+                version=self.version,
                 prompts=prompt_group,
                 responses=responses,
-                rewards=torch.zeros(G),  # placeholder, to be filled by Scorer
+                rewards=torch.zeros(len(responses)),
                 log_probs=[lp.detach() for lp in log_probs],
             )
             self.traj_q.put.remote(trajectory)
@@ -327,12 +336,18 @@ def run_training(num_steps: int = 3):
     prompts = [base_prompt + kw for kw in keywords]
 
     scorer.run.remote()
+
+    # Populate the buffer
+    prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
+    generator.generate.remote(prompt_batch)
+
     for step in range(num_steps):
-        prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
-        generator.generate.remote(prompt_batch)
-        time.sleep(0.1)
+        next_prompt = np.random.choice(prompts, size=2, replace=False).tolist()
+        generator.generate.remote(next_prompt)
+
         # Learner update
         loss = ray.get(learner.step.remote())
+
         weights = ray.get(learner.get_weights.remote())
         version = ray.get(learner.get_version.remote())
         generator.update.remote(weights, version)
@@ -354,5 +369,19 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=3)
     args = parser.parse_args()
 
-    ray.init(ignore_reinit_error=True)
+    ray.init(runtime_env={
+        "excludes": [
+            ".git/**",                           # git metadata and objects
+            ".venv/**",                          # virtual environment
+            "submission_*/**",                   # submission folders (6.9GB)
+            "checkpoint/**",                     # checkpoint folder (731MB)
+            "tests/fixtures/**",                 # test fixtures (large model files)
+            "wandb/**",                          # wandb logs
+            "*.nsys-rep",                        # profiling files
+            "*.pt", "*.pth", "*.safetensors",   # model weight files
+            "*.tar", "*.zip", "*.gz",           # archives
+            "__pycache__/**",                   # Python cache
+            "*.egg-info/**"                     # package info
+        ]
+    }, ignore_reinit_error=True)
     run_once(num_steps=args.steps)

@@ -49,7 +49,7 @@ CHECKPOINT_PATH = "/local1/jiexiao/checkpoint/checkpoint.pth"
 
 N_GRPO_STEPS: int = 100
 LEARNING_RATE: float = 5e-4
-SAMPLING_TEMPERATURE: float = 0.8
+SAMPLING_TEMPERATURE: float = 1.0
 SAMPLING_MAX_TOKENS: int = 60
 ADVANTAGE_EPS: float = 1e-8
 LOSS_TYPE: str = "grpo_clip"
@@ -134,18 +134,20 @@ def generate_text(
             sampled_token = torch.multinomial(softmax_logits, num_samples=1)
 
             # Get log probabilities
-            token_log_prob = torch.log(softmax_logits[sampled_token])
+            token_log_prob = torch.log(softmax_logits[sampled_token] + 1e-8)
             log_probs.append(token_log_prob.squeeze())
 
+            accum_output = torch.cat([accum_output, sampled_token], dim=0)
             if sampled_token.item() == eos_token_id:
                 break
 
-            accum_output = torch.cat([accum_output, sampled_token], dim=0)
 
         # Decode the generated text
-        generated_text = tokenizer.decode(accum_output.tolist())
+        prompt_ids = tokenizer.encode(prompt)
+        response_tokens = accum_output[len(prompt_ids):]
+        completion_text = tokenizer.decode(response_tokens.tolist())
         response_log_probs = torch.stack(log_probs) if log_probs else torch.tensor([], device=accum_output.device)
-    return generated_text, response_log_probs
+    return completion_text, response_log_probs
 
 
 def compute_response_log_probs(
@@ -263,6 +265,22 @@ class Learner:
     """Base learner class for policy gradient updates using TransformerLM."""
     def __init__(self):
         self.device = get_device()
+        self.frozen_model = TransformerLM(
+            vocab_size=VOCAB_SIZE,
+            context_length=CONTEXT_LENGTH,
+            num_layers=NUM_LAYERS,
+            d_model=D_MODEL,
+            num_heads=NUM_HEADS,
+            dff=D_FF,
+            theta=THETA,
+            dtype=torch.float32,
+            device=get_device(),
+        )
+        load_checkpoint(CHECKPOINT_PATH, self.frozen_model, None)
+        self.frozen_model.eval()
+        for param in self.frozen_model.parameters():
+            param.requires_grad = False
+
         # TODO: Initialize the same TransformerLM model as Generator
         self.learner_model = TransformerLM(
             vocab_size=VOCAB_SIZE,
@@ -307,7 +325,7 @@ class Learner:
 
         return advantages
     
-    def update_policy(self, trajectories: List[Trajectory]) -> float:
+    def update_policy(self, trajectories: List[Trajectory], k=1) -> float:
         """Perform one policy update step."""
         # TODO: Implement GRPO/PPO policy update
         # 1. Compute advantages
@@ -337,7 +355,7 @@ class Learner:
                 policy_lp, mask = compute_response_log_probs(prompt, response, self.learner_model)
                 policy_log_probs_list.append(policy_lp)
                 with torch.no_grad():
-                    ref_lp, _ = compute_response_log_probs(prompt, response, self.fronzen_model)
+                    ref_lp, _ = compute_response_log_probs(prompt, response, self.frozen_model)
                     ref_log_probs_list.append(ref_lp.to(self.device))
                 response_masks.append(mask)
                 old_log_probs_list.append(old_lp.to(self.device))
@@ -353,7 +371,7 @@ class Learner:
         loss, _ = grpo_microbatch_train_step(
             policy_log_probs=policy_log_probs,
             response_mask=response_mask,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=k,
             loss_type=LOSS_TYPE,
             advantages=advantages.unsqueeze(-1).to(self.device),
             old_log_probs=old_log_probs,
@@ -363,7 +381,7 @@ class Learner:
         self.optimizer.step()
 
         with torch.no_grad():
-            kl_per_token = (policy_log_probs - ref_log_probs) * torch.exp(policy_log_probs)
+            kl_per_token = (policy_log_probs - ref_log_probs)
             kl_batch = (kl_per_token * response_mask).sum(dim=1)  # sum over tokens per rollout
             kl_value = kl_batch.mean()
 
@@ -376,21 +394,6 @@ class Learner:
 class ColocatedWorker(Generator, Learner):
     """Combined Generator and Learner in a single Ray actor."""
     def __init__(self):
-        self.fronzen_model = TransformerLM(
-            vocab_size=VOCAB_SIZE,
-            context_length=CONTEXT_LENGTH,
-            num_layers=NUM_LAYERS,
-            d_model=D_MODEL,
-            num_heads=NUM_HEADS,
-            dff=D_FF,
-            theta=THETA,
-            dtype=torch.float32,
-            device=get_device(),
-        )
-        self.fronzen_model.eval()
-        for param in self.fronzen_model.parameters():
-            param.requires_grad = False
-
         Generator.__init__(self)
         Learner.__init__(self)
         self.step_count = 0
@@ -398,9 +401,11 @@ class ColocatedWorker(Generator, Learner):
         self.learn_times = []
         self.sync_times = []
         self.kl_values = []
+        self.total_samples = 0
+        self.start_time = time.time()
 
     
-    def training_step(self, prompts: List[str]) -> Dict[str, Any]:
+    def training_step(self, prompts: List[str], k=1) -> Dict[str, Any]:
         """Perform one complete training step: generate rollout + update policy."""
         # Generate trajectories for the batch of prompts
         gen_start = torch.cuda.Event(enable_timing=True)
@@ -419,12 +424,16 @@ class ColocatedWorker(Generator, Learner):
         
         # Update policy using GRPO
         learn_start.record()
-        loss, kl_value = self.update_policy(trajectories)
+        for _ in range(k):
+            loss, kl_value = self.update_policy(trajectories, k=k)
         learn_end.record()
         torch.cuda.synchronize()
         self.learn_times.append(learn_start.elapsed_time(learn_end))
 
-        self.step_count += 1
+        num_samples_step = 0
+        for traj in trajectories:
+            # each response in traj.responses is one sample
+            num_samples_step += len(traj.responses)
 
         # Weight Synchronization 
         sync_start.record()
@@ -434,19 +443,25 @@ class ColocatedWorker(Generator, Learner):
         self.sync_times.append(sync_start.elapsed_time(sync_end))
 
         self.kl_values.append(kl_value)
+
+        self.step_count += 1
+        self.total_samples += num_samples_step
+        elapsed_time = time.time() - self.start_time
+        samples_per_sec = self.total_samples / elapsed_time
         
         return {
             'step': self.step_count,
             'loss': loss,
             'num_trajectories': len(trajectories),
-            'avg_reward': float(torch.cat([traj.rewards for traj in trajectories]).mean()) if trajectories else 0.0
+            'avg_reward': float(torch.cat([traj.rewards for traj in trajectories]).mean()) if trajectories else 0.0,
+            'samples_per_sec': samples_per_sec,
         }
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get current training statistics."""
         return {
             'step_count': self.step_count,
-            'model_parameters': sum(p.numel() for p in self.actor_model.parameters()) if hasattr(self, 'model') else 0,
+            'model_parameters': sum(p.numel() for p in self.actor_model.parameters()),
             'avg_gen_time_ms': np.mean(self.gen_times) if self.gen_times else 0.0,
             'avg_learn_time_ms': np.mean(self.learn_times) if self.learn_times else 0.0,
             'avg_sync_time_ms': np.mean(self.sync_times) if self.sync_times else 0.0,
@@ -473,26 +488,25 @@ def run_training(num_steps: int = 10, num_workers: int = 1):
     for step in range(num_steps):
         for worker in workers:
             # Sample a batch of prompts for each worker
-            prompt_batch = np.random.choice(prompts, size=2, replace=False).tolist()
-            result = ray.get(worker.training_step.remote(prompt_batch))
-            print(f"Worker Step {result['step']}: Loss={result['loss']:.4f}, Avg Reward={result['avg_reward']:.4f}")
+            prompt_batch = np.random.choice(prompts, size=4, replace=False).tolist()
+            result = ray.get(worker.training_step.remote(prompt_batch, k=1))
 
-        worker_stats = ray.get([w.get_statistics.remote() for w in workers])
-        print("Worker Statistics:")
-        for i, stats in enumerate(worker_stats):
-            print(f" Worker {i}: Steps={stats['step_count']}, Params={stats['model_parameters']}, "
-                  f"Avg Gen Time={stats['avg_gen_time_ms']:.2f}ms, "
-                  f"Avg Learn Time={stats['avg_learn_time_ms']:.2f}ms, "
-                  f"Avg Sync Time={stats['avg_sync_time_ms']:.2f}ms")
-            
-            # plot KL values if needed
-            import matplotlib.pyplot as plt
-            if stats['kl_values']:
-                plt.plot(stats['kl_values'])
-                plt.title(f"Worker {i} KL Divergence over Steps")
-                plt.xlabel("Step")
-                plt.ylabel("KL Divergence")
-                plt.savefig(f"kl_divergence.png")
+            if step != 0 and step % 2 == 0:
+
+                print(f"Worker Step {result['step']}: Loss={result['loss']:.4f}, Avg Reward={result['avg_reward']:.4f}, Samples/sec={result['samples_per_sec']:.2f}")
+                worker_stats = ray.get(worker.get_statistics.remote())
+                print("Worker Statistics:")
+                for k, v in worker_stats.items():
+                    print(f"  {k}: {v}")
+                    
+                    # plot KL values if needed
+                    import matplotlib.pyplot as plt
+                    if worker_stats['kl_values']:
+                        plt.plot(worker_stats['kl_values'])
+                        plt.title(f"Worker KL Divergence over Steps")
+                        plt.xlabel("Step")
+                        plt.ylabel("KL Divergence")
+                        plt.savefig(f"kl_divergence.png")
 
 
 def run_once(num_steps: int = 10, num_workers: int = 1):
@@ -510,18 +524,21 @@ if __name__ == "__main__":
                        help="Number of colocated workers")
     args = parser.parse_args()
     
-    ray.init(
-        ignore_reinit_error=True,
-        runtime_env={
-            "working_dir": ".", 
-            "excludes": [
-                ".venv",        
-                ".git",         
-                "__pycache__",
-                "tests/fixtures" 
-            ]
-        }
-    )
+    ray.init(runtime_env={
+        "excludes": [
+            ".git/**",                           # git metadata and objects
+            ".venv/**",                          # virtual environment
+            "submission_*/**",                   # submission folders (6.9GB)
+            "checkpoint/**",                     # checkpoint folder (731MB)
+            "tests/fixtures/**",                 # test fixtures (large model files)
+            "wandb/**",                          # wandb logs
+            "*.nsys-rep",                        # profiling files
+            "*.pt", "*.pth", "*.safetensors",   # model weight files
+            "*.tar", "*.zip", "*.gz",           # archives
+            "__pycache__/**",                   # Python cache
+            "*.egg-info/**"                     # package info
+        ]
+    }, ignore_reinit_error=True)
     
     try:
         run_once(num_steps=args.steps, num_workers=args.workers)

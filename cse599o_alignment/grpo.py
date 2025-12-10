@@ -155,7 +155,7 @@ def masked_mean(
     
     masked_tensor = tensor * mask
     sum_masked = masked_tensor.sum(dim=dim)
-    count_masked = mask.sum(dim=dim)
+    count_masked = mask.sum(dim=dim).clamp_min(1e-8)
     mean_masked = sum_masked / count_masked
     return mean_masked
 
