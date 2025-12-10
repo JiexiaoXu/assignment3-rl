@@ -330,7 +330,7 @@ class Generator:
                 prompts=prompt_group,
                 responses=responses,
                 rewards=torch.zeros(len(responses)),
-                log_probs=[lp.detach() for lp in log_probs],
+                log_probs=[lp.detach().cpu() for lp in log_probs],
             )
             self.traj_q.put.remote(trajectory)
 
